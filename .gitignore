@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+app.py.backup
+app.py.types-backup
+pokemon_hq_backup*.py
+pokemon_hq_before*.py
+pokemon_hq.py.save*
+pokemon_data.json
+pokemon_data_before_web.json
