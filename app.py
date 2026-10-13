@@ -1,13 +1,83 @@
 import json
 import random
 import html
+import os
 from pathlib import Path
 
 import requests
-from flask import Flask, request, redirect, url_for, render_template_string
+from flask import Flask, request, redirect, url_for, render_template_string, session
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import inspect, text
+from werkzeug.security import generate_password_hash, check_password_hash
 from markupsafe import Markup
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get(
+    "SECRET_KEY", "local-development-only-change-before-deploy"
+)
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL", "sqlite:///pokemon_accounts_test.db"
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+login_manager = LoginManager()
+login_manager.login_view = "login"
+login_manager.init_app(app)
+
+sql_db = SQLAlchemy(app)
+class User(UserMixin, sql_db.Model):
+    id = sql_db.Column(sql_db.Integer, primary_key=True)
+    username = sql_db.Column(sql_db.String(40), unique=True, nullable=False)
+    password_hash = sql_db.Column(sql_db.String(255), nullable=False)
+    trainer_xp = sql_db.Column(sql_db.Integer, nullable=False, default=0)
+    trainer_level = sql_db.Column(sql_db.Integer, nullable=False, default=1)
+
+
+class OwnedPokemon(sql_db.Model):
+    id = sql_db.Column(sql_db.Integer, primary_key=True)
+    user_id = sql_db.Column(
+        sql_db.Integer, sql_db.ForeignKey("user.id"), nullable=False
+    )
+    pokemon_name = sql_db.Column(sql_db.String(80), nullable=False)
+    pokemon_id = sql_db.Column(sql_db.Integer, nullable=False)
+    level = sql_db.Column(sql_db.Integer, nullable=False, default=1)
+    rarity = sql_db.Column(sql_db.String(20), nullable=False, default="Common")
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    try:
+        return sql_db.session.get(User, int(user_id))
+    except (ValueError, TypeError):
+        return None
+
+
+with app.app_context():
+    sql_db.create_all()
+    migrations = {
+        "user": {
+            "trainer_xp": "INTEGER NOT NULL DEFAULT 0",
+            "trainer_level": "INTEGER NOT NULL DEFAULT 1",
+        },
+        "owned_pokemon": {
+            "level": "INTEGER NOT NULL DEFAULT 1",
+            "rarity": "VARCHAR(20) NOT NULL DEFAULT 'Common'",
+        },
+    }
+    with sql_db.engine.begin() as connection:
+        for table, additions in migrations.items():
+            existing = {
+                column["name"]
+                for column in inspect(sql_db.engine).get_columns(table)
+            }
+            for column, definition in additions.items():
+                if column not in existing:
+                    connection.execute(text(
+                        f'ALTER TABLE "{table}" '
+                        f'ADD COLUMN "{column}" {definition}'
+                    ))
+
 API = "https://pokeapi.co/api/v2"
 DB_FILE = Path(__file__).resolve().parent / "pokemon_data.json"
 
@@ -57,6 +127,74 @@ def get_pokemon(name):
     if not name:
         return None
     return api_get(f"{API}/pokemon/{name}")
+
+
+RARITY_POOLS = {
+    "Common": [1, 4, 7, 10, 13, 16, 19, 25, 37, 39, 41, 43,
+               52, 54, 60, 74, 92, 100, 133, 161, 172, 252, 255,
+               258, 263, 265, 280, 300, 387, 390, 393, 396, 495,
+               498, 501, 506, 519, 650, 653, 656, 722, 725, 728,
+               810, 813, 816, 906, 909, 912, 915, 917, 921, 944],
+    "Rare": [94, 130, 143, 196, 197, 212, 248, 257, 282, 303,
+             334, 359, 373, 376, 392, 405, 430, 445, 448, 461,
+             462, 468, 473, 475, 530, 635, 706, 715, 784, 887,
+             899, 908, 923, 934, 943, 980, 998],
+    "Epic": [149, 248, 254, 257, 260, 373, 376, 389, 445, 448,
+             475, 530, 635, 706, 715, 784, 887, 897, 901, 923,
+             934, 943, 980, 998, 1005, 1008, 1011, 1018],
+    "Legendary": [144, 145, 146, 150, 243, 244, 245, 249, 250,
+                  377, 378, 379, 380, 381, 382, 383, 384, 480,
+                  481, 482, 483, 484, 485, 486, 487, 488, 638,
+                  639, 640, 641, 642, 643, 644, 645, 646, 716,
+                  717, 718, 785, 786, 787, 788, 791, 792, 800,
+                  888, 889, 890, 891, 892, 895, 896, 898, 905,
+                  1001, 1002, 1003, 1004, 1007, 1009, 1014, 1015,
+                  1016, 1024],
+    "Mythical": [151, 251, 385, 386, 489, 490, 491, 492, 493,
+                 494, 647, 648, 649, 719, 720, 721, 801, 802,
+                 807, 808, 809, 893, 1025],
+}
+
+
+def refresh_trainer_level(user):
+    # XP is total career XP, not XP remaining in the current level.
+    level = 1
+    xp_remaining = max(0, user.trainer_xp)
+
+    while level < 100:
+        xp_needed = level * 100
+        if xp_remaining < xp_needed:
+            break
+        xp_remaining -= xp_needed
+        level += 1
+
+    user.trainer_level = level
+
+
+def make_encounter(trainer_level):
+    rarity = random.choices(
+        ["Common", "Rare", "Epic", "Legendary", "Mythical"],
+        weights=[60, 25, 10, 4, 1],
+        k=1,
+    )[0]
+
+    for _ in range(3):
+        pokemon_id = random.choice(RARITY_POOLS[rarity])
+        data = get_pokemon(pokemon_id)
+        if data:
+            total_stats = sum(
+                stat["base_stat"] for stat in data.get("stats", [])
+            )
+            strength_bonus = max(-3, min(5, (total_stats - 400) // 100))
+            level = max(
+                1,
+                min(100, trainer_level + random.randint(-3, 3)
+                    + strength_bonus),
+            )
+            return data, rarity, level
+
+    return None, None, None
+
 
 BASE = """
 <!doctype html>
@@ -120,6 +258,10 @@ footer{text-align:center;color:#8695b5;padding:25px}
 <a href="/collection">🎒 Collection</a>
 <a href="/types">⚔️ Type Chart</a>
 <a href="/random">✨ Random Pokémon</a>
+<a href="/friends">👥 Friends</a>
+<a href="/battles">⚔️ Battles</a>
+<a href="/login">🔑 Login</a>
+<a href="/register">📝 Register</a>
 </nav>
 </header>
 <main>
@@ -321,42 +463,64 @@ def games():
         rows += '</form></div>'
     return page("Game Library", '<h2>🎮 Game Library</h2><div class="grid">'+rows+'</div>')
 
+
+
 @app.route("/collection", methods=["GET", "POST"])
+@login_required
 def collection():
-    message = ""
     if request.method == "POST":
-        name = request.form.get("pokemon", "").strip().lower()
-        action = request.form.get("action", "")
-        if action == "add":
-            data = get_pokemon(name)
-            if data:
-                if data["name"] not in db["collection"]:
-                    db["collection"].append(data["name"])
-                    save_db()
-                    message = "Pokémon added!"
-                else:
-                    message = "Already in your collection."
-            else:
-                message = "Pokémon not found or API unavailable."
-        elif action == "remove" and name in db["collection"]:
-            db["collection"].remove(name)
-            save_db()
-            message = "Pokémon removed."
+        if request.form.get("action") == "remove":
+            try:
+                instance_id = int(request.form.get("pokemon_instance_id", ""))
+            except (ValueError, TypeError):
+                instance_id = None
+            if instance_id is not None:
+                owned = OwnedPokemon.query.filter_by(
+                    id=instance_id, user_id=current_user.id
+                ).first()
+                if owned:
+                    sql_db.session.delete(owned)
+                    sql_db.session.commit()
         return redirect(url_for("collection"))
-    items = "".join(
-        f'<div class="card"><strong>{esc(name.title())}</strong>'
-        f'<form method="post"><input type="hidden" name="pokemon" value="{esc(name)}">'
-        f'<button class="btn red" name="action" value="remove">Remove</button></form></div>'
-        for name in db["collection"]
-    ) or '<p class="card">Your collection is empty.</p>'
-    content = """
-    <h2>🎒 My Collection</h2>
-    <div class="card"><form method="post">
-    <input name="pokemon" placeholder="Pokémon name" required>
-    <button class="btn green" name="action" value="add">Add Pokémon</button>
-    </form></div>
-    """ + f'<p class="muted">Tracked: {len(db["collection"])}</p><div class="grid">{items}</div>'
+
+    owned_pokemon = OwnedPokemon.query.filter_by(
+        user_id=current_user.id
+    ).order_by(OwnedPokemon.id.desc()).all()
+
+    items = ""
+    for pokemon in owned_pokemon:
+        name = esc(pokemon.pokemon_name.title())
+        items += f"""
+        <div class="card">
+          <strong>{name} #{pokemon.pokemon_id:03}</strong>
+          <p><span class="tag">Level {pokemon.level}</span>
+             <span class="tag">{esc(pokemon.rarity)}</span></p>
+          <form method="post">
+            <input type="hidden" name="pokemon_instance_id"
+                   value="{pokemon.id}">
+            <button class="btn red" name="action" value="remove">
+              Release Pokémon
+            </button>
+          </form>
+        </div>
+        """
+
+    if not items:
+        items = '<p class="card">Your collection is empty. Find a wild encounter to catch your first Pokémon!</p>'
+
+    content = (
+        '<h2>🎒 My Collection</h2>'
+        f'<div class="card"><h3>🏅 Trainer Profile</h3>'
+        f'<p>Trainer: {esc(current_user.username)}</p>'
+        f'<p>Level: {current_user.trainer_level} · '
+        f'Total XP: {current_user.trainer_xp}</p>'
+        f'<p class="muted">Each catch awards 50 XP. XP needed for '
+        f'the next level increases with your current level.</p></div>'
+        f'<p class="muted">Pokémon owned: {len(owned_pokemon)}</p>'
+        f'<div class="grid">{items}</div>'
+    )
     return page("My Collection", content)
+
 
 @app.route("/team", methods=["GET", "POST"])
 def team():
@@ -527,13 +691,156 @@ def types():
     return page("Type Matchups", content)
 
 
+
 @app.route("/random")
+@login_required
 def random_pokemon():
-    data = get_pokemon(str(random.randint(1, 1025)))
+    data, rarity, level = make_encounter(current_user.trainer_level)
     content = '<h2>✨ Wild Encounter!</h2>'
-    content += pokemon_card(data) if data else '<p class="card">Could not reach PokéAPI. Try again.</p>'
-    content += '<a class="btn" href="/random">Find another Pokémon</a>'
-    return page("Random Pokémon", content)
+
+    if data:
+        session["wild_encounter"] = {
+            "pokemon_id": data["id"],
+            "level": level,
+            "rarity": rarity,
+        }
+        content += pokemon_card(data)
+        content += f"""
+        <div class="card">
+          <h3>A wild {esc(data["name"].title())} appeared!</h3>
+          <p><span class="tag">{esc(rarity)}</span>
+             <span class="tag">Level {level}</span></p>
+          <p>Base stat total: {sum(x["base_stat"] for x in data.get("stats", []))}</p>
+          <form method="post" action="/catch">
+            <input type="hidden" name="pokemon_id" value="{data["id"]}">
+            <button class="btn green" type="submit">🎯 Guaranteed Catch</button>
+          </form>
+          <a class="btn" href="/random">Find another Pokémon</a>
+        </div>
+        """
+    else:
+        content += '<p class="card">PokéAPI is unavailable. Try again.</p>'
+        content += '<a class="btn" href="/random">Try again</a>'
+
+    return page("Wild Encounter", content)
+
+
+@app.route("/catch", methods=["POST"])
+@login_required
+def catch_pokemon():
+    encounter = session.get("wild_encounter")
+    try:
+        pokemon_id = int(request.form.get("pokemon_id", ""))
+    except (ValueError, TypeError):
+        return redirect(url_for("random_pokemon"))
+
+    if not encounter or encounter.get("pokemon_id") != pokemon_id:
+        return redirect(url_for("random_pokemon"))
+
+    data = get_pokemon(pokemon_id)
+    if not data:
+        return redirect(url_for("random_pokemon"))
+
+    owned = OwnedPokemon(
+        user_id=current_user.id,
+        pokemon_name=data["name"],
+        pokemon_id=data["id"],
+        level=int(encounter["level"]),
+        rarity=str(encounter["rarity"]),
+    )
+    current_user.trainer_xp += 50
+    refresh_trainer_level(current_user)
+    sql_db.session.add(owned)
+    sql_db.session.commit()
+    session.pop("wild_encounter", None)
+
+    return redirect(url_for("collection"))
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    message = ""
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not username or not password:
+            message = "Enter both a username and password."
+        elif len(username) > 40:
+            message = "Username must be 40 characters or fewer."
+        elif len(password) < 8:
+            message = "Password must be at least 8 characters."
+        elif User.query.filter_by(username=username).first():
+            message = "That username is already taken."
+        else:
+            user = User(
+                username=username,
+                password_hash=generate_password_hash(password)
+            )
+            sql_db.session.add(user)
+            sql_db.session.commit()
+            login_user(user)
+            return redirect(url_for("home"))
+
+    content = f"""
+    <section class="card">
+      <h2>Create Trainer Account</h2>
+      <p>{html.escape(message)}</p>
+      <form method="post">
+        <input name="username" placeholder="Choose a username"
+               maxlength="40" required>
+        <input name="password" type="password"
+               placeholder="Password (8+ characters)" minlength="8" required>
+        <button class="btn green" type="submit">Register</button>
+      </form>
+      <p>Already registered? <a href="/login">Log in</a></p>
+    </section>
+    """
+    return page("Register", content)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    message = ""
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = User.query.filter_by(username=username).first()
+
+        if user and check_password_hash(user.password_hash, password):
+            login_user(user)
+            return redirect(url_for("home"))
+
+        message = "Incorrect username or password."
+
+    content = f"""
+    <section class="card">
+      <h2>Trainer Login</h2>
+      <p>{html.escape(message)}</p>
+      <form method="post">
+        <input name="username" placeholder="Username" maxlength="40" required>
+        <input name="password" type="password" placeholder="Password" required>
+        <button class="btn blue" type="submit">Log In</button>
+      </form>
+      <p>New trainer? <a href="/register">Create an account</a></p>
+    </section>
+    """
+    return page("Login", content)
+
+
+@app.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("home"))
+
+from multiplayer import register_multiplayer
+register_multiplayer(
+    app, sql_db, User, OwnedPokemon, page, api_get, API,
+    refresh_trainer_level
+)
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=False)
