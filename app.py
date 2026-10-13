@@ -351,17 +351,17 @@ def pokemon_card(data):
                     conditions = []
                     if details.get("min_level"):
                         conditions.append("Level " + str(details["min_level"]))
-                    if details.get("item", {}).get("name"):
+                    if (details.get("item") or {}).get("name"):
                         conditions.append("Use " + details["item"]["name"].replace("-", " ").title())
-                    if details.get("trigger", {}).get("name") == "trade":
+                    if (details.get("trigger") or {}).get("name") == "trade":
                         conditions.append("Trade")
                     if details.get("min_happiness"):
                         conditions.append("Friendship " + str(details["min_happiness"]) + "+")
                     if details.get("time_of_day"):
                         conditions.append(details["time_of_day"].title() + " time")
-                    if details.get("known_move", {}).get("name"):
+                    if (details.get("known_move") or {}).get("name"):
                         conditions.append("Knows " + details["known_move"]["name"].replace("-", " ").title())
-                    if details.get("location", {}).get("name"):
+                    if (details.get("location") or {}).get("name"):
                         conditions.append("At " + details["location"]["name"].replace("-", " ").title())
                     requirement = ", ".join(conditions) if conditions else "Special condition; see Pokédex"
                     transitions.append(node["species"]["name"].title() + " → " +
