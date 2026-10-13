@@ -2,6 +2,9 @@ import json
 import random
 import html
 import os
+import secrets
+import hashlib
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -13,9 +16,14 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from markupsafe import Markup
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get(
-    "SECRET_KEY", "local-development-only-change-before-deploy"
-)
+_secret_key = os.environ.get("SECRET_KEY")
+if not _secret_key:
+    if os.environ.get("PORT"):
+        raise RuntimeError(
+            "Set a persistent SECRET_KEY environment variable before deploying."
+        )
+    _secret_key = secrets.token_hex(32)
+app.config["SECRET_KEY"] = _secret_key
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "DATABASE_URL", "sqlite:///pokemon_accounts_test.db"
 )
@@ -43,6 +51,16 @@ class OwnedPokemon(sql_db.Model):
     pokemon_id = sql_db.Column(sql_db.Integer, nullable=False)
     level = sql_db.Column(sql_db.Integer, nullable=False, default=1)
     rarity = sql_db.Column(sql_db.String(20), nullable=False, default="Common")
+    exp = sql_db.Column(sql_db.Integer, nullable=False, default=0)
+
+
+class Invitation(sql_db.Model):
+    id = sql_db.Column(sql_db.Integer, primary_key=True)
+    code_hash = sql_db.Column(sql_db.String(64), unique=True, nullable=False)
+    created_by_id = sql_db.Column(sql_db.Integer, sql_db.ForeignKey("user.id"), nullable=False)
+    created_at = sql_db.Column(sql_db.DateTime, nullable=False, default=datetime.utcnow)
+    used_by_id = sql_db.Column(sql_db.Integer, sql_db.ForeignKey("user.id"))
+    used_at = sql_db.Column(sql_db.DateTime)
 
 
 @login_manager.user_loader
@@ -63,6 +81,7 @@ with app.app_context():
         "owned_pokemon": {
             "level": "INTEGER NOT NULL DEFAULT 1",
             "rarity": "VARCHAR(20) NOT NULL DEFAULT 'Common'",
+            "exp": "INTEGER NOT NULL DEFAULT 0",
         },
     }
     with sql_db.engine.begin() as connection:
@@ -201,7 +220,7 @@ BASE = """
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">\n{% if auto_refresh %}<meta http-equiv="refresh" content="5">{% endif %}
 <title>{{ title }} | Pokemon Command Center</title>
 <style>
 :root{color-scheme:dark}
@@ -260,8 +279,10 @@ footer{text-align:center;color:#8695b5;padding:25px}
 <a href="/random">✨ Random Pokémon</a>
 <a href="/friends">👥 Friends</a>
 <a href="/battles">⚔️ Battles</a>
+<a href="/trades">🔁 Trades</a>
 <a href="/login">🔑 Login</a>
 <a href="/register">📝 Register</a>
+{% if current_user.is_authenticated and current_user.username == "Luffy" %}<a href="/owner/invitations">🔐 Owner Invites</a>{% endif %}
 </nav>
 </header>
 <main>
@@ -273,8 +294,10 @@ footer{text-align:center;color:#8695b5;padding:25px}
 """
 
 def page(title, content):
+    auto_refresh = str(title).startswith("Battle · Refresh")
+    display_title = str(title).replace("Battle · Refresh", "Battle")
     return render_template_string(
-        BASE, title=title, content=Markup(content)
+        BASE, title=display_title, content=Markup(content), auto_refresh=auto_refresh
     )
 
 def pokemon_card(data):
@@ -316,13 +339,40 @@ def pokemon_card(data):
         evo = api_get(evo_url) if evo_url else None
         if evo:
             family = []
+            transitions = []
+            selected_evolves = False
             def flatten(node):
+                nonlocal selected_evolves
                 family.append(node["species"]["name"].title())
+                if node["species"]["name"].lower() == data["name"].lower():
+                    selected_evolves = bool(node.get("evolves_to"))
                 for child in node.get("evolves_to", []):
+                    details = (child.get("evolution_details") or [{}])[0]
+                    conditions = []
+                    if details.get("min_level"):
+                        conditions.append("Level " + str(details["min_level"]))
+                    if details.get("item", {}).get("name"):
+                        conditions.append("Use " + details["item"]["name"].replace("-", " ").title())
+                    if details.get("trigger", {}).get("name") == "trade":
+                        conditions.append("Trade")
+                    if details.get("min_happiness"):
+                        conditions.append("Friendship " + str(details["min_happiness"]) + "+")
+                    if details.get("time_of_day"):
+                        conditions.append(details["time_of_day"].title() + " time")
+                    if details.get("known_move", {}).get("name"):
+                        conditions.append("Knows " + details["known_move"]["name"].replace("-", " ").title())
+                    if details.get("location", {}).get("name"):
+                        conditions.append("At " + details["location"]["name"].replace("-", " ").title())
+                    requirement = ", ".join(conditions) if conditions else "Special condition; see Pokédex"
+                    transitions.append(node["species"]["name"].title() + " → " +
+                                       child["species"]["name"].title() + " (" + requirement + ")")
                     flatten(child)
             flatten(evo["chain"])
-            extra += '<p><strong>Evolution family:</strong> ' + \
-                " → ".join(esc(x) for x in family) + '</p>'
+            extra += '<p><strong>Evolution family:</strong> ' + " → ".join(esc(x) for x in family) + '</p>'
+            if transitions:
+                extra += '<p><strong>Evolution requirements:</strong></p><ul>' + ''.join('<li>' + esc(t) + '</li>' for t in transitions) + '</ul>'
+            if not selected_evolves:
+                extra += '<p><strong>Evolution:</strong> This Pokémon does not evolve further.</p>'
     return f"""
     <section class="card pokemon">
       <div>{image}</div>
@@ -469,18 +519,27 @@ def games():
 @login_required
 def collection():
     if request.method == "POST":
-        if request.form.get("action") == "remove":
-            try:
-                instance_id = int(request.form.get("pokemon_instance_id", ""))
-            except (ValueError, TypeError):
-                instance_id = None
-            if instance_id is not None:
-                owned = OwnedPokemon.query.filter_by(
-                    id=instance_id, user_id=current_user.id
-                ).first()
-                if owned:
-                    sql_db.session.delete(owned)
-                    sql_db.session.commit()
+        try:
+            instance_id = int(request.form.get("pokemon_instance_id", ""))
+        except (ValueError, TypeError):
+            instance_id = None
+        action = request.form.get("action")
+        if instance_id is not None:
+            owned = OwnedPokemon.query.filter_by(
+                id=instance_id, user_id=current_user.id
+            ).first()
+            if owned and action == "remove":
+                sql_db.session.delete(owned)
+                sql_db.session.commit()
+            elif owned and action == "train":
+                owned.exp = max(0, owned.exp or 0) + 25
+                while owned.level < 100:
+                    needed = 100 + (owned.level - 1) * 25
+                    if owned.exp < needed:
+                        break
+                    owned.exp -= needed
+                    owned.level += 1
+                sql_db.session.commit()
         return redirect(url_for("collection"))
 
     owned_pokemon = OwnedPokemon.query.filter_by(
@@ -490,17 +549,24 @@ def collection():
     items = ""
     for pokemon in owned_pokemon:
         name = esc(pokemon.pokemon_name.title())
+        exp_now = max(0, pokemon.exp or 0)
+        exp_needed = 100 + (pokemon.level - 1) * 25
+        progress = min(100, int(exp_now * 100 / exp_needed))
+        sprite = f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{pokemon.pokemon_id}.png"
         items += f"""
-        <div class="card">
+        <div class="card pokebox-card">
+          <img src="{sprite}" alt="{name}" loading="lazy" width="112" height="112">
           <strong>{name} #{pokemon.pokemon_id:03}</strong>
           <p><span class="tag">Level {pokemon.level}</span>
              <span class="tag">{esc(pokemon.rarity)}</span></p>
+          <p>EXP: {exp_now} / {exp_needed}</p>
+          <div style="height:10px;background:#303b58;border-radius:8px;overflow:hidden">
+            <div style="height:10px;width:{progress}%;background:#38d9a9"></div>
+          </div>
           <form method="post">
-            <input type="hidden" name="pokemon_instance_id"
-                   value="{pokemon.id}">
-            <button class="btn red" name="action" value="remove">
-              Release Pokémon
-            </button>
+            <input type="hidden" name="pokemon_instance_id" value="{pokemon.id}">
+            <button class="btn blue" name="action" value="train">Train +25 EXP</button>
+            <button class="btn red" name="action" value="remove">Release Pokémon</button>
           </form>
         </div>
         """
@@ -747,6 +813,7 @@ def catch_pokemon():
         pokemon_id=data["id"],
         level=int(encounter["level"]),
         rarity=str(encounter["rarity"]),
+        exp=0,
     )
     current_user.trainer_xp += 50
     refresh_trainer_level(current_user)
@@ -764,14 +831,21 @@ def register():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        invite_code = request.form.get("invite_code", "").strip()
+        invitation = None
+        if invite_code:
+            invite_hash = hashlib.sha256(invite_code.encode("utf-8")).hexdigest()
+            invitation = Invitation.query.filter_by(code_hash=invite_hash, used_by_id=None).first()
 
         if not username or not password:
             message = "Enter both a username and password."
+        elif not invitation:
+            message = "A valid, unused invitation code is required."
         elif len(username) > 40:
             message = "Username must be 40 characters or fewer."
         elif len(password) < 8:
             message = "Password must be at least 8 characters."
-        elif User.query.filter_by(username=username).first():
+        elif User.query.filter(sql_db.func.lower(User.username) == username.lower()).first():
             message = "That username is already taken."
         else:
             user = User(
@@ -779,6 +853,9 @@ def register():
                 password_hash=generate_password_hash(password)
             )
             sql_db.session.add(user)
+            sql_db.session.flush()
+            invitation.used_by_id = user.id
+            invitation.used_at = datetime.utcnow()
             sql_db.session.commit()
             login_user(user)
             return redirect(url_for("home"))
@@ -787,7 +864,9 @@ def register():
     <section class="card">
       <h2>Create Trainer Account</h2>
       <p>{html.escape(message)}</p>
+      <p>Registration is invitation-only. Ask the site owner for a code.</p>
       <form method="post">
+        <input name="invite_code" placeholder="Invitation code" autocomplete="off" required>
         <input name="username" placeholder="Choose a username"
                maxlength="40" required>
         <input name="password" type="password"
@@ -828,6 +907,51 @@ def login():
     </section>
     """
     return page("Login", content)
+
+
+def is_site_owner(user):
+    return bool(user and getattr(user, "is_authenticated", False)
+                and user.username == "Luffy")
+
+
+@app.route("/owner/invitations", methods=["GET", "POST"])
+@login_required
+def owner_invitations():
+    if not is_site_owner(current_user):
+        return page("Forbidden", '<section class="card"><h2>Access denied</h2><p>Only the Luffy owner account can manage invitations.</p></section>'), 403
+    new_code = None
+    owner_csrf = session.get("owner_invite_csrf")
+    if not owner_csrf:
+        owner_csrf = secrets.token_urlsafe(24)
+        session["owner_invite_csrf"] = owner_csrf
+    if request.method == "POST":
+        supplied = request.form.get("csrf_token", "")
+        if not secrets.compare_digest(supplied, owner_csrf):
+            return page("Forbidden", "<section class='card'>Invalid form token. Reload and try again.</section>"), 400
+        new_code = secrets.token_urlsafe(12)
+        code_hash = hashlib.sha256(new_code.encode("utf-8")).hexdigest()
+        sql_db.session.add(Invitation(code_hash=code_hash, created_by_id=current_user.id))
+        sql_db.session.commit()
+    invitations = Invitation.query.order_by(Invitation.id.desc()).limit(30).all()
+    rows = "".join(
+        f'<li>Invitation #{row.id} — '
+        + ("Used" if row.used_by_id else "Unused")
+        + f' — created {row.created_at.strftime("%Y-%m-%d %H:%M UTC")}</li>'
+        for row in invitations
+    ) or "<li>No invitations generated yet.</li>"
+    fresh = f'<section class="card"><h3>Copy this new code now</h3><code>{esc(new_code)}</code><p>This code is shown only once. Save it securely.</p></section>' if new_code else ""
+    content = f'<h2>Owner invitation manager</h2><p>Signed in as {esc(current_user.username)}. Each invitation can be used once.</p>{fresh}<section class="card"><form method="post"><input type="hidden" name="csrf_token" value="{esc(owner_csrf)}"><button class="btn green">Generate invitation</button></form><h3>Recent invitations</h3><ul>{rows}</ul></section>'
+    return page("Owner Invitations", content)
+
+
+@app.before_request
+def invitation_access_gate():
+    public_endpoints = {"home", "login", "register", "static"}
+    if request.endpoint is None or request.endpoint in public_endpoints:
+        return None
+    if not current_user.is_authenticated:
+        return redirect(url_for("login", next=request.path))
+    return None
 
 
 @app.route("/logout", methods=["POST"])

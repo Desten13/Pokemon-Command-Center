@@ -55,6 +55,15 @@ def register_multiplayer(app, sql_db, User, OwnedPokemon, page,
         current_turn_user_id = sql_db.Column(sql_db.Integer)
         winner_id = sql_db.Column(sql_db.Integer)
 
+    class TradeOffer(sql_db.Model):
+        id = sql_db.Column(sql_db.Integer, primary_key=True)
+        sender_id = sql_db.Column(sql_db.Integer, sql_db.ForeignKey("user.id"), nullable=False)
+        receiver_id = sql_db.Column(sql_db.Integer, sql_db.ForeignKey("user.id"), nullable=False)
+        offered_pokemon_id = sql_db.Column(sql_db.Integer, sql_db.ForeignKey("owned_pokemon.id"), nullable=False)
+        requested_pokemon_id = sql_db.Column(sql_db.Integer, sql_db.ForeignKey("owned_pokemon.id"), nullable=False)
+        status = sql_db.Column(sql_db.String(20), nullable=False, default="pending")
+        created_at = sql_db.Column(sql_db.DateTime, nullable=False, default=__import__("datetime").datetime.utcnow)
+
     with app.app_context():
         sql_db.create_all()
 
@@ -719,4 +728,125 @@ def register_multiplayer(app, sql_db, User, OwnedPokemon, page,
         for entry in state.get("log", [])[-20:]:
             out += f"<li>{e(entry)}</li>"
         out += "</ul></section><p><a href='/battles'>Back to battles</a></p>"
-        return page("Battle", out)
+        refresh_title = (
+            "Battle · Refresh"
+            if battle.status in ("pending", "active")
+            and battle.current_turn_user_id != current_user.id
+            else "Battle"
+        )
+        return page(refresh_title, out)
+
+
+    @app.route("/trades", methods=["GET", "POST"])
+    @login_required
+    def trades_page():
+        message = ""
+        if request.method == "POST":
+            check_token()
+            action = request.form.get("action", "")
+            if action == "offer":
+                try:
+                    receiver_id = int(request.form.get("receiver_id", ""))
+                    offered_id = int(request.form.get("offered_pokemon_id", ""))
+                    requested_id = int(request.form.get("requested_pokemon_id", ""))
+                except (ValueError, TypeError):
+                    receiver_id = offered_id = requested_id = -1
+                offered = OwnedPokemon.query.filter_by(id=offered_id, user_id=current_user.id).first()
+                requested = OwnedPokemon.query.filter_by(id=requested_id, user_id=receiver_id).first()
+                if receiver_id == current_user.id or not are_friends(current_user.id, receiver_id):
+                    message = "Trades can only be offered to an accepted friend."
+                elif not offered or not requested:
+                    message = "Choose Pokémon that are still owned by the correct trainers."
+                else:
+                    offer = TradeOffer(sender_id=current_user.id, receiver_id=receiver_id,
+                                       offered_pokemon_id=offered.id,
+                                       requested_pokemon_id=requested.id, status="pending")
+                    sql_db.session.add(offer)
+                    sql_db.session.commit()
+                    return redirect(url_for("trades_page"))
+            elif action in ("accept", "decline"):
+                try:
+                    offer_id = int(request.form.get("offer_id", ""))
+                except (ValueError, TypeError):
+                    offer_id = -1
+                offer = TradeOffer.query.filter_by(id=offer_id, receiver_id=current_user.id,
+                                                   status="pending").first()
+                if not offer:
+                    message = "That trade is no longer available."
+                elif action == "decline":
+                    offer.status = "declined"
+                    sql_db.session.commit()
+                    return redirect(url_for("trades_page"))
+                else:
+                    offered = OwnedPokemon.query.filter_by(
+                        id=offer.offered_pokemon_id, user_id=offer.sender_id).with_for_update().first()
+                    requested = OwnedPokemon.query.filter_by(
+                        id=offer.requested_pokemon_id, user_id=offer.receiver_id).with_for_update().first()
+                    if not offered or not requested:
+                        offer.status = "cancelled"
+                        sql_db.session.commit()
+                        message = "Trade cancelled because one Pokémon is no longer owned by its original trainer."
+                    else:
+                        # The sender confirmed by making the offer; receiver confirms here.
+                        offered.user_id, requested.user_id = offer.receiver_id, offer.sender_id
+                        offer.status = "completed"
+                        sql_db.session.commit()
+                        return redirect(url_for("trades_page"))
+
+        friends = sorted(friends_with(current_user.id))
+        friend_options = []
+        for friend_id in friends:
+            friend = sql_db.session.get(User, friend_id)
+            if friend:
+                friend_options.append((friend.id, friend.username))
+        mine = OwnedPokemon.query.filter_by(user_id=current_user.id).order_by(OwnedPokemon.id.desc()).all()
+        incoming = TradeOffer.query.filter_by(receiver_id=current_user.id, status="pending").order_by(TradeOffer.id.desc()).all()
+        outgoing = TradeOffer.query.filter_by(sender_id=current_user.id).order_by(TradeOffer.id.desc()).limit(20).all()
+        own_options = ''.join(f'<option value="{p.id}">{e(p.pokemon_name.title())} Lv.{p.level} (#{p.pokemon_id})</option>' for p in mine)
+        form = ""
+        if friend_options and mine:
+            friend_cards = []
+            for friend_id, friend_name in friend_options:
+                friend_mons = OwnedPokemon.query.filter_by(user_id=friend_id).order_by(OwnedPokemon.id.desc()).all()
+                if not friend_mons:
+                    continue
+                their_options = ''.join(f'<option value="{p.id}">{e(p.pokemon_name.title())} Lv.{p.level} (#{p.pokemon_id})</option>' for p in friend_mons)
+                friend_cards.append(
+                    '<section class="card"><h3>Trade with ' + e(friend_name) + '</h3>'
+                    '<form method="post">' + token_field() +
+                    '<input type="hidden" name="action" value="offer">'
+                    f'<input type="hidden" name="receiver_id" value="{friend_id}">'
+                    '<label>Offer your Pokémon <select name="offered_pokemon_id" required>' + own_options + '</select></label>'
+                    '<label>Request theirs <select name="requested_pokemon_id" required>' + their_options + '</select></label>'
+                    '<button class="btn green">Send trade offer</button></form></section>'
+                )
+            form = ''.join(friend_cards) or '<p class="card">Your friends need Pokémon in their collections before trading.</p>'
+        elif not friend_options:
+            form = '<p class="card">Add and accept a friend first. You can only trade with friends.</p>'
+        else:
+            form = '<p class="card">Catch a Pokémon before creating a trade offer.</p>'
+
+        incoming_html = ""
+        for offer in incoming:
+            sender = sql_db.session.get(User, offer.sender_id)
+            offered = sql_db.session.get(OwnedPokemon, offer.offered_pokemon_id)
+            requested = sql_db.session.get(OwnedPokemon, offer.requested_pokemon_id)
+            incoming_html += (
+                '<section class="card"><h3>Trade offer from ' + e(sender.username if sender else "Unknown") + '</h3>'
+                f'<p>They offer: {e(offered.pokemon_name.title() if offered else "Unavailable")}</p>'
+                f'<p>They request: {e(requested.pokemon_name.title() if requested else "Unavailable")}</p>'
+                '<form method="post">' + token_field() +
+                f'<input type="hidden" name="offer_id" value="{offer.id}">'
+                '<button class="btn green" name="action" value="accept">Accept trade</button>'
+                '<button class="btn red" name="action" value="decline">Decline</button></form></section>'
+            )
+        outgoing_html = ''.join(
+            f'<li>Offer #{o.id} to {e((sql_db.session.get(User, o.receiver_id).username if sql_db.session.get(User, o.receiver_id) else "Unknown"))}: {e(o.status.title())}</li>'
+            for o in outgoing
+        ) or "<li>No outgoing offers yet.</li>"
+        content = '<h2>🔁 Pokémon Trading</h2><p>Sending an offer is your confirmation; the other trainer must accept before ownership changes. Ownership is rechecked when accepted.</p>'
+        if message:
+            content += '<p class="card">' + e(message) + '</p>'
+        content += '<h3>Incoming offers</h3>' + (incoming_html or '<p class="card">No pending offers.</p>')
+        content += '<h3>Create a trade</h3>' + form + '<section class="card"><h3>Outgoing offers</h3><ul>' + outgoing_html + '</ul></section>'
+        return page("Trades", content)
