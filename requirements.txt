@@ -1,3 +1,6 @@
 Flask
 requests
 gunicorn
+Flask-Login
+Flask-SQLAlchemy
+psycopg[binary]
